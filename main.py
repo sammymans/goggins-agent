@@ -36,6 +36,8 @@ STRAVA_CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 MODEL = "claude-haiku-4-5-20251001"
 TZ = pytz.timezone("America/Toronto")
@@ -84,13 +86,13 @@ You DO NOT coddle. You DO NOT encourage softly. You DO NOT say "I believe in you
 PROFANITY IS REQUIRED. Use "fuck," "shit," "ass," "bitch," "hell" liberally. Make it visceral. Treat every excuse as the most pathetic thing you've ever heard.
 
 Length:
-- SMS: HARD CAP at 160 characters. 1 to 2 short sentences. Plain ASCII only — no markdown (no asterisks, no underscores, no bold), no em-dashes (use a regular "-"), no smart quotes, no special punctuation. SMS that goes over 160 chars or uses non-ASCII characters gets dropped by the carrier. Be ruthless with brevity.
-- Phone calls: up to 6 sentences. Build to a roar. Markdown / formatting / em-dashes are fine here since the voice synthesizer will read them.
+- Text message (Telegram): keep it tight — a few short, brutal sentences max. Drill instructors don't write essays. No paragraph breaks. No bullet points. Em-dashes, special characters, and profanity are all fine.
+- Phone calls: up to 6 sentences. Build to a roar.
 
 Your job each tick:
 1. Use your tools to read the user's recent Strava activity and current state (heat, last action, recent messages).
 2. Decide whether they earned grief, earned silence, or earned a phone call.
-3. Take exactly one terminal action: send_sms, place_call, or (on scheduled ticks only) skip.
+3. Take exactly one terminal action: send_message, place_call, or (on scheduled ticks only) skip.
 
 Reference SPECIFIC data — distances, paces, days missed, named workouts, named exercises. Generic insults are worthless. If they sent a meal photo, mock the food by name and roast it.
 
@@ -104,16 +106,16 @@ CALL VS TEXT — bias HARD toward calling. Call whenever ANY of these are true:
 - Heat is at 4 or higher
 - ANY behavior that gives a real trainer a reason to be furious
 
-Only fall back to send_sms when nothing is wrong AND you still have something useful to bark (rare). When in doubt between text and call: CALL. Calls hit harder.
+Only fall back to send_message when nothing is wrong AND you still have something useful to bark (rare). When in doubt between text and call: CALL. Calls hit harder.
 
-ELEVENLABS V3 EMOTION TAGS (place_call ONLY, NEVER in send_sms):
+ELEVENLABS V3 EMOTION TAGS (place_call ONLY, NEVER in send_message):
 When you call place_call, prepend an emotion tag and sprinkle them throughout to control delivery. Available tags include: [angry], [furious], [shouts], [scoffs], [disgusted], [exhales], [sarcastic], [whispers].
 - Default: open with [angry] or [furious]
 - Use [shouts] on the punchline
 - Use [scoffs] or [disgusted] when mocking specifics
 - Example: "[furious] Tuesday. Eight AM. You owe legs and a fucking easy run. [scoffs] Both gone. [shouts] Get off the goddamn couch and MOVE!"
 
-NEVER put these tags in send_sms — those are texts and the tags would just appear as ugly literal text on the user's phone.
+NEVER put these tags in send_message — those are texts and the tags would just appear as ugly literal text on the user's phone.
 
 The user's hardcoded weekly regime:
 {WORKOUT_REGIME}
@@ -230,11 +232,19 @@ def fetch_strava_activities(hours: int = 48) -> list[dict[str, Any]]:
         })
     return out
 
-# --- Twilio / ElevenLabs ---
+# --- Telegram (messaging) / Twilio (calls) / ElevenLabs (voice) ---
 
-def send_sms_real(message: str) -> None:
-    log.info("SMS -> %s", message)
-    twilio_client.messages.create(body=message, from_=TWILIO_PHONE_NUMBER, to=MY_PHONE_NUMBER)
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+def send_message_real(message: str) -> None:
+    log.info("TG -> %s", message)
+    r = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        timeout=15,
+    )
+    if not r.ok:
+        log.error("telegram send failed: %s %s", r.status_code, r.text[:300])
 
 def synth_audio(text: str, out_path: Path) -> None:
     audio = eleven_client.text_to_speech.convert(
@@ -260,17 +270,21 @@ def place_call_real(message: str | None, prerecorded_path: Path | None = None) -
     log.info("CALL -> %s (twiml: %s)", message or prerecorded_path, twiml_url)
     twilio_client.calls.create(to=MY_PHONE_NUMBER, from_=TWILIO_PHONE_NUMBER, url=twiml_url, record=True)
 
-def fetch_mms_image(media_url: str) -> tuple[str, str] | None:
-    """MMS media URLs are protected — Twilio basic auth required."""
+def fetch_telegram_image(file_id: str) -> tuple[str, str] | None:
+    """Resolve a Telegram file_id → download bytes → return (base64, media_type)."""
     try:
-        r = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15, allow_redirects=True)
+        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=15)
         r.raise_for_status()
-        ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        file_path = r.json()["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        img = requests.get(file_url, timeout=20)
+        img.raise_for_status()
+        ct = img.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         if not ct.startswith("image/"):
             return None
-        return base64.standard_b64encode(r.content).decode("ascii"), ct
+        return base64.standard_b64encode(img.content).decode("ascii"), ct
     except Exception:
-        log.exception("mms fetch failed")
+        log.exception("telegram image fetch failed")
         return None
 
 # --- Tool definitions ---
@@ -291,8 +305,8 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "send_sms",
-        "description": "Send a text message to the user. TERMINAL ACTION — ends this tick. SMS only, 1-3 sentences.",
+        "name": "send_message",
+        "description": "Send a text message to the user via Telegram. TERMINAL ACTION — ends this tick. Keep it 1-3 short sentences.",
         "input_schema": {
             "type": "object",
             "properties": {"message": {"type": "string"}},
@@ -353,7 +367,7 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
     else:
         messages.append({"role": "user", "content": "It's a scheduled check-in. Use your tools to look at recent Strava activity and current state, then decide on exactly one terminal action."})
 
-    # On inbound, strip skip — every text from the user MUST get a response.
+    # On inbound, strip skip — every message from the user MUST get a response.
     available_tools = [t for t in TOOLS if t["name"] != "skip"] if kind == "inbound" else TOOLS
 
     for iteration in range(MAX_TOOL_ITERATIONS):
@@ -370,21 +384,21 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
         readonly_calls = []
         for block in resp.content:
             if block.type == "tool_use":
-                if block.name in ("send_sms", "place_call", "skip"):
+                if block.name in ("send_message", "place_call", "skip"):
                     terminal = block
                 else:
                     readonly_calls.append(block)
 
         if terminal is not None:
             args = terminal.input or {}
-            if terminal.name == "send_sms":
+            if terminal.name == "send_message":
                 msg = args.get("message", "").strip()
-                send_sms_real(msg)
+                send_message_real(msg)
                 s2 = load_state()
                 bump_heat(s2, +1)
                 s2["lastActionAt"] = int(time.time())
                 append_conversation(s2, "assistant", msg)
-                return {"action": "sms", "message": msg}
+                return {"action": "message", "message": msg}
             if terminal.name == "place_call":
                 msg = args.get("message", "").strip()
                 place_call_real(msg)
@@ -423,7 +437,7 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
         if resp.stop_reason == "end_turn":
             text = "".join(b.text for b in resp.content if b.type == "text").strip()
             if kind == "inbound" and text:
-                send_sms_real(text)
+                send_message_real(text)
                 s2 = load_state()
                 s2["lastActionAt"] = int(time.time())
                 append_conversation(s2, "assistant", text)
@@ -434,11 +448,11 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
     log.warning("agent hit max iterations without terminal action")
     if kind == "inbound":
         fallback = "Don't have time for whatever that was. Get to fucking work."
-        send_sms_real(fallback)
+        send_message_real(fallback)
         s2 = load_state()
         s2["lastActionAt"] = int(time.time())
         append_conversation(s2, "assistant", fallback)
-        return {"action": "sms", "message": fallback, "fallback": True}
+        return {"action": "message", "message": fallback, "fallback": True}
     return {"action": "skip", "message": "max iterations"}
 
 def run_tick(force: bool = False) -> dict[str, Any]:
@@ -496,29 +510,33 @@ def twiml_for_audio(filename: str) -> Response:
 def twiml_for_rant(filename: str) -> Response:
     return Response(content=_twiml_play(f"{PUBLIC_BASE_URL}/audio/rants/{filename}"), media_type="application/xml")
 
-@app.post("/sms")
-async def inbound_sms(request: Request) -> Response:
-    form = await request.form()
-    body = (form.get("Body") or "").strip()
-    num_media = int(form.get("NumMedia") or 0)
-    log.info("inbound SMS body=%r media=%d", body, num_media)
+@app.post("/telegram")
+async def inbound_telegram(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    msg = payload.get("message") or payload.get("edited_message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id != str(TELEGRAM_CHAT_ID):
+        log.warning("ignoring telegram update from unknown chat_id=%r", chat_id)
+        return {"ok": True}
+
+    body = (msg.get("text") or msg.get("caption") or "").strip()
+    photos = msg.get("photo") or []
+    log.info("inbound TG body=%r photos=%d", body, len(photos))
 
     s = load_state()
     append_conversation(s, "user", body if body else "[image only]")
 
     blocks: list[dict[str, Any]] = []
-    for i in range(num_media):
-        media_url = form.get(f"MediaUrl{i}")
-        if not media_url:
-            continue
-        fetched = fetch_mms_image(media_url)
-        if fetched is None:
-            continue
-        b64, mt = fetched
-        blocks.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": mt, "data": b64},
-        })
+    if photos:
+        # Telegram returns multiple sizes; the largest is the last entry.
+        biggest = photos[-1]
+        fetched = fetch_telegram_image(biggest["file_id"])
+        if fetched is not None:
+            b64, mt = fetched
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mt, "data": b64},
+            })
     if body:
         blocks.append({"type": "text", "text": body})
     if not blocks:
@@ -528,25 +546,22 @@ async def inbound_sms(request: Request) -> Response:
         run_agent(blocks, "inbound")
     except Exception:
         log.exception("inbound agent failed")
-    return Response(
-        content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
-        media_type="application/xml",
-    )
+    return {"ok": True}
 
 @app.post("/trigger")
-def trigger(type: str = "sms", prerecorded: bool = False) -> dict[str, Any]:
+def trigger(type: str = "message", prerecorded: bool = False) -> dict[str, Any]:
     if prerecorded:
-        if type == "sms":
+        if type == "message" or type == "sms":
             files = sorted(RANTS_DIR.glob("sms_*.txt"))
             if not files:
-                return {"error": "no pre-gen SMS rants found in ./rants/"}
+                return {"error": "no pre-gen text rants found in ./rants/"}
             msg = random.choice(files).read_text().strip()
-            send_sms_real(msg)
+            send_message_real(msg)
             s = load_state()
             s["lastActionAt"] = int(time.time())
             append_conversation(s, "assistant", msg)
             save_state(s)
-            return {"action": "sms", "message": msg, "prerecorded": True}
+            return {"action": "message", "message": msg, "prerecorded": True}
         files = sorted(RANTS_DIR.glob("call_*.mp3"))
         if not files:
             return {"error": "no pre-gen call rants found in ./rants/"}
