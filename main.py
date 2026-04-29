@@ -352,10 +352,16 @@ def dispatch_readonly(name: str, args: dict[str, Any]) -> Any:
 
 # --- Agent loop ---
 
-def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> dict[str, Any]:
+def run_agent(
+    user_message_blocks: list[dict[str, Any]] | None,
+    kind: str,
+    force_type: str | None = None,
+    custom_boot: str | None = None,
+) -> dict[str, Any]:
     """
-    kind: 'tick' (scheduled or manual) | 'inbound' (replying to SMS).
-    Returns {action: 'sms'|'call'|'skip'|'reply', message: str|None}
+    kind: 'tick' (scheduled or manual) | 'inbound' (replying to user message).
+    force_type: 'call' or 'message' to restrict the terminal tool the agent can pick.
+    custom_boot: override the default tick boot message (used for manual triggers with instructions).
     """
     s = load_state()
     decay_heat_if_new_day(s)
@@ -364,11 +370,17 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
     if kind == "inbound":
         assert user_message_blocks is not None
         messages.append({"role": "user", "content": user_message_blocks})
+    elif custom_boot:
+        messages.append({"role": "user", "content": custom_boot})
     else:
         messages.append({"role": "user", "content": "It's a scheduled check-in. Use your tools to look at recent Strava activity and current state, then decide on exactly one terminal action."})
 
     # On inbound, strip skip — every message from the user MUST get a response.
-    available_tools = [t for t in TOOLS if t["name"] != "skip"] if kind == "inbound" else TOOLS
+    available_tools = [t for t in TOOLS if t["name"] != "skip"] if kind == "inbound" else list(TOOLS)
+    if force_type == "call":
+        available_tools = [t for t in available_tools if t["name"] != "send_message"]
+    elif force_type == "message":
+        available_tools = [t for t in available_tools if t["name"] != "place_call"]
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         resp = anthropic_client.messages.create(
@@ -549,7 +561,36 @@ async def inbound_telegram(request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 @app.post("/trigger")
-def trigger(type: str = "message", prerecorded: bool = False) -> dict[str, Any]:
+def trigger(
+    type: str = "message",
+    prerecorded: bool = False,
+    text: str | None = None,
+    instructions: str | None = None,
+) -> dict[str, Any]:
+    """
+    Manual trigger.
+      ?text=...          → send/speak verbatim, agent bypassed
+      ?instructions=...  → agent generates based on instructions; pair with type=call|message
+      ?prerecorded=true  → fire random pre-gen rant from ./rants/
+      (none)             → existing scheduled-tick behavior, agent decides
+    """
+    # Verbatim path
+    if text:
+        if type == "call":
+            place_call_real(text)
+            s = load_state()
+            bump_heat(s, +2)
+            s["lastActionAt"] = int(time.time())
+            append_conversation(s, "assistant", f"[CALL] {text}")
+            return {"action": "call", "message": text, "verbatim": True}
+        send_message_real(text)
+        s = load_state()
+        bump_heat(s, +1)
+        s["lastActionAt"] = int(time.time())
+        append_conversation(s, "assistant", text)
+        return {"action": "message", "message": text, "verbatim": True}
+
+    # Pre-recorded path
     if prerecorded:
         if type == "message" or type == "sms":
             files = sorted(RANTS_DIR.glob("sms_*.txt"))
@@ -571,4 +612,27 @@ def trigger(type: str = "message", prerecorded: bool = False) -> dict[str, Any]:
         s["lastActionAt"] = int(time.time())
         save_state(s)
         return {"action": "call", "file": chosen.name, "prerecorded": True}
+
+    # Agent-with-instructions path
+    if instructions:
+        boot = (
+            f"Manual trigger from the operator. They want you to take action right now with this guidance: {instructions}\n\n"
+            "Use get_strava_recent and get_state if you need context, then take exactly one terminal action. "
+            "The instructions tell you what to focus on and roughly what to say — adapt them to your voice, don't repeat them verbatim."
+        )
+        try:
+            return run_agent(None, "tick", force_type=(type if type in ("call", "message") else None), custom_boot=boot)
+        except Exception:
+            log.exception("manual trigger with instructions failed")
+            return {"action": "skip", "message": "error"}
+
+    # Default: existing tick behavior
     return run_tick(force=True)
+
+@app.post("/reset")
+def reset_state() -> dict[str, Any]:
+    """Wipe state.json — heat, conversation, last action time. Strava tokens get rebuilt from env."""
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+    log.info("state reset via /reset")
+    return {"ok": True, "wiped": True}
