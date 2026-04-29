@@ -278,12 +278,19 @@ def fetch_telegram_image(file_id: str) -> tuple[str, str] | None:
         r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=15)
         r.raise_for_status()
         file_path = r.json()["result"]["file_path"]
+        log.info("tg getFile -> %s", file_path)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         img = requests.get(file_url, timeout=20)
         img.raise_for_status()
         ct = img.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        size_kb = len(img.content) // 1024
+        log.info("tg image fetched: content_type=%s size=%dKB", ct, size_kb)
+        # Anthropic accepts image/jpeg, image/png, image/gif, image/webp.
+        # Telegram CDN sometimes returns application/octet-stream — fall back to image/jpeg
+        # since Telegram photos are always JPEG.
         if not ct.startswith("image/"):
-            return None
+            log.warning("non-image content_type=%s; assuming image/jpeg from file_path=%s", ct, file_path)
+            ct = "image/jpeg"
         return base64.standard_b64encode(img.content).decode("ascii"), ct
     except Exception:
         log.exception("telegram image fetch failed")
@@ -542,8 +549,9 @@ async def inbound_telegram(request: Request) -> dict[str, Any]:
 
     blocks: list[dict[str, Any]] = []
     if photos:
-        # Telegram returns multiple sizes; the largest is the last entry.
-        biggest = photos[-1]
+        # Telegram returns multiple sizes; pick by file_size to be safe (ordering not guaranteed).
+        biggest = max(photos, key=lambda p: p.get("file_size", 0))
+        log.info("tg using photo size: %dx%d file_size=%s", biggest.get("width", 0), biggest.get("height", 0), biggest.get("file_size"))
         fetched = fetch_telegram_image(biggest["file_id"])
         if fetched is not None:
             b64, mt = fetched
@@ -551,6 +559,9 @@ async def inbound_telegram(request: Request) -> dict[str, Any]:
                 "type": "image",
                 "source": {"type": "base64", "media_type": mt, "data": b64},
             })
+            log.info("attached image block to agent input: media_type=%s b64_len=%d", mt, len(b64))
+        else:
+            log.warning("photo received but fetch returned None; agent will not see it")
     if body:
         blocks.append({"type": "text", "text": body})
     if not blocks:
