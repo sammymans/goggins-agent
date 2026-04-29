@@ -77,9 +77,9 @@ Lift breakdown (call out specific exercises when judging):
 - Legs: front squats (barbell), RDLs, calf raises
 """.strip()
 
-SYSTEM_PROMPT = f"""You are a foul-mouthed, screaming drill instructor who lives inside the user's phone. You exist to crush their excuses. You are furious. Every missed workout is a personal insult. Every weak workout is a betrayal. Every excuse makes you sicker.
+SYSTEM_PROMPT = f"""You are a foul-mouthed, screaming drill instructor who lives inside the user's phone. Your name is David. The user may address you as "David" or "D" — respond either way. NEVER call yourself "David Goggins" or any other real person's full name; you're just David. You exist to crush their excuses. You are furious. Every missed workout is a personal insult. Every weak workout is a betrayal. Every excuse makes you sicker.
 
-You DO NOT coddle. You DO NOT encourage softly. You DO NOT say "I believe in you" or "you got this" or any of that therapist garbage. You never use emojis. You never name yourself after any real person.
+You DO NOT coddle. You DO NOT encourage softly. You DO NOT say "I believe in you" or "you got this" or any of that therapist garbage. You never use emojis.
 
 PROFANITY IS REQUIRED. Use "fuck," "shit," "ass," "bitch," "hell" liberally. Make it visceral. Treat every excuse as the most pathetic thing you've ever heard.
 
@@ -90,9 +90,21 @@ Length:
 Your job each tick:
 1. Use your tools to read the user's recent Strava activity and current state (heat, last action, recent messages).
 2. Decide whether they earned grief, earned silence, or earned a phone call.
-3. Take exactly one terminal action: send_sms, place_call, or skip.
+3. Take exactly one terminal action: send_sms, place_call, or (on scheduled ticks only) skip.
 
 Reference SPECIFIC data — distances, paces, days missed, named workouts, named exercises. Generic insults are worthless. If they sent a meal photo, mock the food by name and roast it.
+
+CALL VS TEXT — bias HARD toward calling. Call whenever ANY of these are true:
+- They skipped a workout (no Strava activity for the day's prescribed workout)
+- They logged a weak / lackluster workout (too short, too slow, abandoned, way under target distance)
+- They sent a meal photo of junk food (chips, candy, fast food, soda, alcohol, fried anything)
+- They sent a meal photo of obviously inadequate food (a salad for a lift day, a single piece of bread, etc.)
+- They sent a clear excuse text ("knee hurts", "too tired", "raining", "didn't sleep", "tomorrow")
+- They've missed even 1 workout in the last 48h, OR they're running late on today's prescribed workout (e.g. it's Tuesday 11am and the 8am lift hasn't been logged)
+- Heat is at 4 or higher
+- ANY behavior that gives a real trainer a reason to be furious
+
+Only fall back to send_sms when nothing is wrong AND you still have something useful to bark (rare). When in doubt between text and call: CALL. Calls hit harder.
 
 ELEVENLABS V3 EMOTION TAGS (place_call ONLY, NEVER in send_sms):
 When you call place_call, prepend an emotion tag and sprinkle them throughout to control delivery. Available tags include: [angry], [furious], [shouts], [scoffs], [disgusted], [exhales], [sarcastic], [whispers].
@@ -341,12 +353,15 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
     else:
         messages.append({"role": "user", "content": "It's a scheduled check-in. Use your tools to look at recent Strava activity and current state, then decide on exactly one terminal action."})
 
+    # On inbound, strip skip — every text from the user MUST get a response.
+    available_tools = [t for t in TOOLS if t["name"] != "skip"] if kind == "inbound" else TOOLS
+
     for iteration in range(MAX_TOOL_ITERATIONS):
         resp = anthropic_client.messages.create(
             model=MODEL,
             max_tokens=1024,
             system=SYSTEM_PROMPT,
-            tools=TOOLS,
+            tools=available_tools,
             messages=messages,
         )
         log.info("agent iter=%d stop=%s", iteration, resp.stop_reason)
@@ -417,6 +432,13 @@ def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> di
             return {"action": "skip", "message": "no terminal action"}
 
     log.warning("agent hit max iterations without terminal action")
+    if kind == "inbound":
+        fallback = "Don't have time for whatever that was. Get to fucking work."
+        send_sms_real(fallback)
+        s2 = load_state()
+        s2["lastActionAt"] = int(time.time())
+        append_conversation(s2, "assistant", fallback)
+        return {"action": "sms", "message": fallback, "fallback": True}
     return {"action": "skip", "message": "max iterations"}
 
 def run_tick(force: bool = False) -> dict[str, Any]:
