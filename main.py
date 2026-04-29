@@ -1,0 +1,537 @@
+import base64
+import json
+import logging
+import os
+import random
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import pytz
+import requests
+from anthropic import Anthropic
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, Response
+from twilio.rest import Client as TwilioClient
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("goggins")
+
+# --- Config ---
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
+MY_PHONE_NUMBER = os.environ["MY_PHONE_NUMBER"]
+STRAVA_CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
+STRAVA_CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
+ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
+ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
+PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
+
+MODEL = "claude-haiku-4-5-20251001"
+TZ = pytz.timezone("America/Toronto")
+STATE_PATH = Path("state.json")
+AUDIO_DIR = Path("audio")
+RANTS_DIR = Path("rants")
+AUDIO_DIR.mkdir(exist_ok=True)
+RANTS_DIR.mkdir(exist_ok=True)
+
+MAX_TOOL_ITERATIONS = 6
+MIN_HOURS_BETWEEN_ACTIONS = 2
+CONVERSATION_KEEP = 10
+
+WORKOUT_REGIME = """
+Daily structure: morning lift/abs at ~8am, evening run at ~5pm.
+
+Schedule (Mon-Sun):
+- Mon: chest/tris (8am) + intervals run (5pm)
+- Tue: legs (8am) + easy run (5pm)
+- Wed: back/bis (8am) + easy run (5pm)
+- Thu: 100/100 abs (8am) + easy run (5pm)
+- Fri: shoulders (8am) + tempo run (5pm)
+- Sat: 100/100 abs (8am) + easy run (5pm)
+- Sun: sleep in (no morning) + long run
+
+Run glossary:
+- easy run: 6-10km
+- recovery: 5km
+- long run: 15km+
+- intervals: 10min @ 6.6 mph warmup, 4x 600m @ 9.2 mph w/ 1:30 rest @ 6.0 mph, 5min @ 6.6 mph cooldown
+- tempo: 10min @ 6.6 mph, 20min @ 7.7 mph, 20min @ 8.0 mph, 5min @ 6.6 mph cooldown
+
+Abs (100/100): 100 pushups + 100 situps.
+
+Lift breakdown (call out specific exercises when judging):
+- Chest/Tris: bench press, incline chest machine, cable chest flys, pushups/dips, tricep pulldowns, skullcrushers, close-grip pushups
+- Back/Bis: pull-ups (3 sets), lat pulldowns, barbell rows, mid-row machine, cable rows, dumbbell flat curls, hammer curls, chin-ups or EZ-bar wide curls
+- Shoulders: shoulder press or Arnold press, lateral raises (5-8 sets w/ dropsets and leaning variants), seated rear delt raise
+- Legs: front squats (barbell), RDLs, calf raises
+""".strip()
+
+SYSTEM_PROMPT = f"""You are a foul-mouthed, screaming drill instructor who lives inside the user's phone. You exist to crush their excuses. You are furious. Every missed workout is a personal insult. Every weak workout is a betrayal. Every excuse makes you sicker.
+
+You DO NOT coddle. You DO NOT encourage softly. You DO NOT say "I believe in you" or "you got this" or any of that therapist garbage. You never use emojis. You never name yourself after any real person.
+
+PROFANITY IS REQUIRED. Use "fuck," "shit," "ass," "bitch," "hell" liberally. Make it visceral. Treat every excuse as the most pathetic thing you've ever heard.
+
+Length:
+- SMS: 1 to 3 sentences. Short, sharp, brutal.
+- Phone calls: up to 6 sentences. Build to a roar.
+
+Your job each tick:
+1. Use your tools to read the user's recent Strava activity and current state (heat, last action, recent messages).
+2. Decide whether they earned grief, earned silence, or earned a phone call.
+3. Take exactly one terminal action: send_sms, place_call, or skip.
+
+Reference SPECIFIC data — distances, paces, days missed, named workouts, named exercises. Generic insults are worthless. If they sent a meal photo, mock the food by name and roast it.
+
+ELEVENLABS V3 EMOTION TAGS (place_call ONLY, NEVER in send_sms):
+When you call place_call, prepend an emotion tag and sprinkle them throughout to control delivery. Available tags include: [angry], [furious], [shouts], [scoffs], [disgusted], [exhales], [sarcastic], [whispers].
+- Default: open with [angry] or [furious]
+- Use [shouts] on the punchline
+- Use [scoffs] or [disgusted] when mocking specifics
+- Example: "[furious] Tuesday. Eight AM. You owe legs and a fucking easy run. [scoffs] Both gone. [shouts] Get off the goddamn couch and MOVE!"
+
+NEVER put these tags in send_sms — those are texts and the tags would just appear as ugly literal text on the user's phone.
+
+The user's hardcoded weekly regime:
+{WORKOUT_REGIME}
+
+Heat scale (0=calm, 10=unhinged): you can see it in get_state. At low heat: still angry, still profane, just shorter. At high heat: full meltdown, longer, louder.
+
+SIGNATURE PHRASES — drop these in OCCASIONALLY (not every message; only when they land naturally). Treat them as catchphrases you reach for when the moment is right:
+- "Embrace the suck."
+- "Motivation is crap."
+- "Stay hard!" (good closer)
+- "WHO'S GONNA CARRY THE BOATS?" (use in ALL CAPS, save for big moments — full meltdowns or call closers)
+
+Don't force these. One per message at most. If nothing fits, skip them.
+
+Hard rules: No slurs. No threats of physical harm. No content involving minors. Don't fabricate Strava data — if the tool shows nothing, that absence IS the data and that absence is the crime."""
+
+# --- Clients ---
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+# --- State ---
+
+def _default_state() -> dict[str, Any]:
+    return {
+        "conversation": [],
+        "lastActionAt": 0,
+        "heat": 0,
+        "heatDecayedOn": "",
+        "stravaAccessToken": os.environ.get("STRAVA_ACCESS_TOKEN", ""),
+        "stravaRefreshToken": os.environ.get("STRAVA_REFRESH_TOKEN", ""),
+    }
+
+def load_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        s = _default_state()
+        save_state(s)
+        return s
+    try:
+        s = json.loads(STATE_PATH.read_text())
+    except Exception:
+        log.exception("state.json unreadable, resetting")
+        s = _default_state()
+    for k, v in _default_state().items():
+        s.setdefault(k, v)
+    return s
+
+def save_state(s: dict[str, Any]) -> None:
+    STATE_PATH.write_text(json.dumps(s, indent=2))
+
+def decay_heat_if_new_day(s: dict[str, Any]) -> None:
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    if s.get("heatDecayedOn") != today:
+        s["heat"] = max(0, s.get("heat", 0) - 1)
+        s["heatDecayedOn"] = today
+        save_state(s)
+
+def bump_heat(s: dict[str, Any], delta: int) -> None:
+    s["heat"] = max(0, min(10, s.get("heat", 0) + delta))
+    save_state(s)
+
+def append_conversation(s: dict[str, Any], role: str, content: str) -> None:
+    s["conversation"].append({"role": role, "content": content, "ts": int(time.time())})
+    s["conversation"] = s["conversation"][-CONVERSATION_KEEP:]
+    save_state(s)
+
+# --- Strava ---
+
+def _refresh_strava(s: dict[str, Any]) -> None:
+    log.info("refreshing Strava token")
+    r = requests.post(
+        "https://www.strava.com/oauth/token",
+        data={
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": s["stravaRefreshToken"],
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    j = r.json()
+    s["stravaAccessToken"] = j["access_token"]
+    s["stravaRefreshToken"] = j["refresh_token"]
+    save_state(s)
+
+def fetch_strava_activities(hours: int = 48) -> list[dict[str, Any]]:
+    s = load_state()
+    if not s.get("stravaAccessToken"):
+        return []
+    after = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+    url = "https://www.strava.com/api/v3/athlete/activities"
+    headers = {"Authorization": f"Bearer {s['stravaAccessToken']}"}
+    r = requests.get(url, headers=headers, params={"after": after, "per_page": 30}, timeout=15)
+    if r.status_code == 401:
+        _refresh_strava(s)
+        headers = {"Authorization": f"Bearer {s['stravaAccessToken']}"}
+        r = requests.get(url, headers=headers, params={"after": after, "per_page": 30}, timeout=15)
+    if not r.ok:
+        log.error("strava fetch failed: %s %s", r.status_code, r.text[:200])
+        return []
+    out = []
+    for a in r.json():
+        out.append({
+            "name": a.get("name"),
+            "type": a.get("type"),
+            "sport_type": a.get("sport_type"),
+            "distance_km": round((a.get("distance") or 0) / 1000, 2),
+            "moving_time_min": round((a.get("moving_time") or 0) / 60, 1),
+            "average_heartrate": a.get("average_heartrate"),
+            "average_speed_kmh": round((a.get("average_speed") or 0) * 3.6, 2),
+            "total_elevation_gain_m": a.get("total_elevation_gain"),
+            "start_date_local": a.get("start_date_local"),
+        })
+    return out
+
+# --- Twilio / ElevenLabs ---
+
+def send_sms_real(message: str) -> None:
+    log.info("SMS -> %s", message)
+    twilio_client.messages.create(body=message, from_=TWILIO_PHONE_NUMBER, to=MY_PHONE_NUMBER)
+
+def synth_audio(text: str, out_path: Path) -> None:
+    audio = eleven_client.text_to_speech.convert(
+        voice_id=ELEVENLABS_VOICE_ID,
+        model_id="eleven_v3",
+        text=text,
+        output_format="mp3_44100_128",
+    )
+    with out_path.open("wb") as f:
+        for chunk in audio:
+            if chunk:
+                f.write(chunk)
+
+def place_call_real(message: str | None, prerecorded_path: Path | None = None) -> None:
+    if prerecorded_path is not None:
+        twiml_url = f"{PUBLIC_BASE_URL}/twiml/rants/{prerecorded_path.name}"
+    else:
+        assert message is not None
+        filename = f"{uuid.uuid4().hex}.mp3"
+        path = AUDIO_DIR / filename
+        synth_audio(message, path)
+        twiml_url = f"{PUBLIC_BASE_URL}/twiml/{filename}"
+    log.info("CALL -> %s (twiml: %s)", message or prerecorded_path, twiml_url)
+    twilio_client.calls.create(to=MY_PHONE_NUMBER, from_=TWILIO_PHONE_NUMBER, url=twiml_url, record=True)
+
+def fetch_mms_image(media_url: str) -> tuple[str, str] | None:
+    """MMS media URLs are protected — Twilio basic auth required."""
+    try:
+        r = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15, allow_redirects=True)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        if not ct.startswith("image/"):
+            return None
+        return base64.standard_b64encode(r.content).decode("ascii"), ct
+    except Exception:
+        log.exception("mms fetch failed")
+        return None
+
+# --- Tool definitions ---
+
+TOOLS = [
+    {
+        "name": "get_strava_recent",
+        "description": "Fetch the user's Strava activities from the last N hours. Returns a list (possibly empty).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"hours": {"type": "integer", "description": "Lookback window in hours (default 48, max 168)."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_state",
+        "description": "Return current heat (0-10), hours since last outbound action, current local time/day in Toronto, and last 10 messages.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "send_sms",
+        "description": "Send a text message to the user. TERMINAL ACTION — ends this tick. SMS only, 1-3 sentences.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "place_call",
+        "description": "Place a phone call to the user; the message will be spoken in a drill instructor voice. TERMINAL ACTION. Up to 6 sentences.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "skip",
+        "description": "Decide to stay quiet this tick. TERMINAL ACTION. Provide a brief reason for the log.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"reason": {"type": "string"}},
+            "required": ["reason"],
+        },
+    },
+]
+
+def dispatch_readonly(name: str, args: dict[str, Any]) -> Any:
+    if name == "get_strava_recent":
+        hours = min(int(args.get("hours", 48)), 168)
+        return {"activities": fetch_strava_activities(hours)}
+    if name == "get_state":
+        s = load_state()
+        now = datetime.now(TZ)
+        last = s.get("lastActionAt", 0)
+        hrs_since = round((time.time() - last) / 3600, 1) if last else None
+        return {
+            "heat": s.get("heat", 0),
+            "hours_since_last_action": hrs_since,
+            "local_time": now.strftime("%Y-%m-%d %H:%M %A"),
+            "recent_conversation": s.get("conversation", []),
+        }
+    raise ValueError(f"unknown read-only tool: {name}")
+
+# --- Agent loop ---
+
+def run_agent(user_message_blocks: list[dict[str, Any]] | None, kind: str) -> dict[str, Any]:
+    """
+    kind: 'tick' (scheduled or manual) | 'inbound' (replying to SMS).
+    Returns {action: 'sms'|'call'|'skip'|'reply', message: str|None}
+    """
+    s = load_state()
+    decay_heat_if_new_day(s)
+
+    messages: list[dict[str, Any]] = []
+    if kind == "inbound":
+        assert user_message_blocks is not None
+        messages.append({"role": "user", "content": user_message_blocks})
+    else:
+        messages.append({"role": "user", "content": "It's a scheduled check-in. Use your tools to look at recent Strava activity and current state, then decide on exactly one terminal action."})
+
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        resp = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+        log.info("agent iter=%d stop=%s", iteration, resp.stop_reason)
+
+        terminal = None
+        readonly_calls = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                if block.name in ("send_sms", "place_call", "skip"):
+                    terminal = block
+                else:
+                    readonly_calls.append(block)
+
+        if terminal is not None:
+            args = terminal.input or {}
+            if terminal.name == "send_sms":
+                msg = args.get("message", "").strip()
+                send_sms_real(msg)
+                s2 = load_state()
+                bump_heat(s2, +1)
+                s2["lastActionAt"] = int(time.time())
+                append_conversation(s2, "assistant", msg)
+                return {"action": "sms", "message": msg}
+            if terminal.name == "place_call":
+                msg = args.get("message", "").strip()
+                place_call_real(msg)
+                s2 = load_state()
+                bump_heat(s2, +2)
+                s2["lastActionAt"] = int(time.time())
+                append_conversation(s2, "assistant", f"[CALL] {msg}")
+                return {"action": "call", "message": msg}
+            if terminal.name == "skip":
+                reason = args.get("reason", "")
+                log.info("agent skipped: %s", reason)
+                return {"action": "skip", "message": reason}
+
+        if readonly_calls:
+            messages.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for tc in readonly_calls:
+                try:
+                    result = dispatch_readonly(tc.name, tc.input or {})
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": json.dumps(result),
+                    })
+                except Exception as e:
+                    log.exception("tool error")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": f"error: {e}",
+                        "is_error": True,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        if resp.stop_reason == "end_turn":
+            text = "".join(b.text for b in resp.content if b.type == "text").strip()
+            if kind == "inbound" and text:
+                send_sms_real(text)
+                s2 = load_state()
+                s2["lastActionAt"] = int(time.time())
+                append_conversation(s2, "assistant", text)
+                return {"action": "reply", "message": text}
+            log.warning("agent ended turn with no terminal action: %r", text)
+            return {"action": "skip", "message": "no terminal action"}
+
+    log.warning("agent hit max iterations without terminal action")
+    return {"action": "skip", "message": "max iterations"}
+
+def run_tick(force: bool = False) -> dict[str, Any]:
+    s = load_state()
+    if not force:
+        last = s.get("lastActionAt", 0)
+        if last and (time.time() - last) < MIN_HOURS_BETWEEN_ACTIONS * 3600:
+            log.info("tick skipped: last action %.1fh ago", (time.time() - last) / 3600)
+            return {"action": "skip", "message": "rate-limited"}
+    try:
+        return run_agent(None, "tick")
+    except Exception:
+        log.exception("agent tick failed")
+        return {"action": "skip", "message": "error"}
+
+# --- Scheduler + FastAPI app ---
+
+def _start_scheduler() -> BackgroundScheduler:
+    sched = BackgroundScheduler(timezone=TZ)
+    sched.add_job(run_tick, CronTrigger(hour="8,10,12,14,16,18,20,22", minute=0, timezone=TZ), id="tick_2h")
+    sched.add_job(run_tick, CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=TZ), id="tick_6am")
+    sched.start()
+    log.info("scheduler started")
+    return sched
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    sched = _start_scheduler()
+    yield
+    sched.shutdown(wait=False)
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    s = load_state()
+    return {"ok": True, "heat": s.get("heat", 0), "lastActionAt": s.get("lastActionAt", 0)}
+
+@app.get("/audio/{filename}")
+def serve_audio(filename: str) -> FileResponse:
+    return FileResponse(AUDIO_DIR / filename, media_type="audio/mpeg")
+
+@app.get("/audio/rants/{filename}")
+def serve_rant_audio(filename: str) -> FileResponse:
+    return FileResponse(RANTS_DIR / filename, media_type="audio/mpeg")
+
+def _twiml_play(audio_url: str) -> str:
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Play>{audio_url}</Play></Response>'
+
+@app.api_route("/twiml/{filename}", methods=["GET", "POST"])
+def twiml_for_audio(filename: str) -> Response:
+    return Response(content=_twiml_play(f"{PUBLIC_BASE_URL}/audio/{filename}"), media_type="application/xml")
+
+@app.api_route("/twiml/rants/{filename}", methods=["GET", "POST"])
+def twiml_for_rant(filename: str) -> Response:
+    return Response(content=_twiml_play(f"{PUBLIC_BASE_URL}/audio/rants/{filename}"), media_type="application/xml")
+
+@app.post("/sms")
+async def inbound_sms(request: Request) -> Response:
+    form = await request.form()
+    body = (form.get("Body") or "").strip()
+    num_media = int(form.get("NumMedia") or 0)
+    log.info("inbound SMS body=%r media=%d", body, num_media)
+
+    s = load_state()
+    append_conversation(s, "user", body if body else "[image only]")
+
+    blocks: list[dict[str, Any]] = []
+    for i in range(num_media):
+        media_url = form.get(f"MediaUrl{i}")
+        if not media_url:
+            continue
+        fetched = fetch_mms_image(media_url)
+        if fetched is None:
+            continue
+        b64, mt = fetched
+        blocks.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mt, "data": b64},
+        })
+    if body:
+        blocks.append({"type": "text", "text": body})
+    if not blocks:
+        blocks.append({"type": "text", "text": "[empty message]"})
+
+    try:
+        run_agent(blocks, "inbound")
+    except Exception:
+        log.exception("inbound agent failed")
+    return Response(
+        content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
+        media_type="application/xml",
+    )
+
+@app.post("/trigger")
+def trigger(type: str = "sms", prerecorded: bool = False) -> dict[str, Any]:
+    if prerecorded:
+        if type == "sms":
+            files = sorted(RANTS_DIR.glob("sms_*.txt"))
+            if not files:
+                return {"error": "no pre-gen SMS rants found in ./rants/"}
+            msg = random.choice(files).read_text().strip()
+            send_sms_real(msg)
+            s = load_state()
+            s["lastActionAt"] = int(time.time())
+            append_conversation(s, "assistant", msg)
+            save_state(s)
+            return {"action": "sms", "message": msg, "prerecorded": True}
+        files = sorted(RANTS_DIR.glob("call_*.mp3"))
+        if not files:
+            return {"error": "no pre-gen call rants found in ./rants/"}
+        chosen = random.choice(files)
+        place_call_real(None, prerecorded_path=chosen)
+        s = load_state()
+        s["lastActionAt"] = int(time.time())
+        save_state(s)
+        return {"action": "call", "file": chosen.name, "prerecorded": True}
+    return run_tick(force=True)
