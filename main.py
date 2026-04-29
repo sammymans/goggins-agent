@@ -104,7 +104,7 @@ CALL VS TEXT — bias HARD toward calling. Call whenever ANY of these are true:
 - They sent a meal photo of junk food (chips, candy, fast food, soda, alcohol, fried anything)
 - They sent a meal photo of obviously inadequate food (a salad for a lift day, a single piece of bread, etc.)
 - They sent a clear excuse text ("knee hurts", "too tired", "raining", "didn't sleep", "tomorrow")
-- They've missed even 1 workout in the last 48h, OR they're running late on today's prescribed workout (e.g. it's Tuesday 11am and the 8am lift hasn't been logged)
+- They're missing or running late on today's prescribed workout (e.g. it's Tuesday 11am and the 8am lift hasn't been logged). If yesterday's miss is still showing up in your Strava data window, that's fair game too. But ONLY react to what's actually in your tool's data — don't invent or rehash misses from older days you can't see. And don't keep bringing up grievances from your own past messages once the data has moved on.
 - Heat is at 4 or higher
 - ANY behavior that gives a real trainer a reason to be furious
 
@@ -204,7 +204,7 @@ def _refresh_strava(s: dict[str, Any]) -> None:
     s["stravaRefreshToken"] = j["refresh_token"]
     save_state(s)
 
-def fetch_strava_activities(hours: int = 48) -> list[dict[str, Any]]:
+def fetch_strava_activities(hours: int = 24) -> list[dict[str, Any]]:
     s = load_state()
     if not s.get("stravaAccessToken"):
         return []
@@ -301,10 +301,10 @@ def fetch_telegram_image(file_id: str) -> tuple[str, str] | None:
 TOOLS = [
     {
         "name": "get_strava_recent",
-        "description": "Fetch the user's Strava activities from the last N hours. Returns a list (possibly empty).",
+        "description": "Fetch the user's Strava activities from the last N hours. Default 24h — covers today and recent yesterday. Returns a list (possibly empty).",
         "input_schema": {
             "type": "object",
-            "properties": {"hours": {"type": "integer", "description": "Lookback window in hours (default 48, max 168)."}},
+            "properties": {"hours": {"type": "integer", "description": "Lookback window in hours (default 24, max 168). Leave at default unless you have a specific reason to look further back."}},
             "required": [],
         },
     },
@@ -344,7 +344,7 @@ TOOLS = [
 
 def dispatch_readonly(name: str, args: dict[str, Any]) -> Any:
     if name == "get_strava_recent":
-        hours = min(int(args.get("hours", 48)), 168)
+        hours = min(int(args.get("hours", 24)), 168)
         return {"activities": fetch_strava_activities(hours)}
     if name == "get_state":
         s = load_state()
